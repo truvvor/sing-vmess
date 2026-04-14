@@ -2,6 +2,7 @@ package vless
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"io"
 
@@ -13,6 +14,20 @@ import (
 	"github.com/sagernet/sing/common/rw"
 	"github.com/sagernet/sing/common/varbin"
 )
+
+// Anti-DPI #4: VLESS header padding 16-64B for non-XTLS flows.
+// Server's proto.Unmarshal ignores errors and treats addons as empty.
+const (
+	vlessPaddingMin = 16
+	vlessPaddingMax = 64
+)
+
+func randPaddingLen() int {
+	var b [1]byte
+	_, _ = rand.Read(b[:])
+	span := vlessPaddingMax - vlessPaddingMin + 1
+	return vlessPaddingMin + int(b[0])%span
+}
 
 const (
 	Version    = 0
@@ -85,39 +100,44 @@ type Addons struct {
 
 // func readAddons(reader varbin.Reader) (*Addons, error) {
 func readAddons(reader *bytes.Reader) (*Addons, error) {
-	var addons Addons
-	for reader.Len() > 0 {
-		protoHeader, err := reader.ReadByte()
-		if err != nil {
-			return nil, err
-		}
-		switch protoHeader {
-		case (1 << 3) | 2:
-			flowLen, err := binary.ReadUvarint(reader)
-			if err != nil {
-				return nil, err
-			}
-			flowBytes := make([]byte, flowLen)
-			_, err = io.ReadFull(reader, flowBytes)
-			if err != nil {
-				return nil, err
-			}
-			addons.Flow = string(flowBytes)
-		case (2 << 3) | 2:
-			seedLen, err := binary.ReadUvarint(reader)
-			if err != nil {
-				return nil, err
-			}
-			seedBytes := make([]byte, seedLen)
-			_, err = io.ReadFull(reader, seedBytes)
-			if err != nil {
-				return nil, err
-			}
-			addons.Seed = string(seedBytes)
-		default:
-			return nil, E.New("unknown protobuf message header: ", protoHeader)
-		}
+	protoHeader, err := reader.ReadByte()
+	if err != nil {
+		return nil, err
 	}
+	if protoHeader != 10 {
+		return nil, E.New("unknown protobuf message header: ", protoHeader)
+	}
+
+	var addons Addons
+
+	flowLen, err := binary.ReadUvarint(reader)
+	if err != nil {
+		if err == io.EOF {
+			return &addons, nil
+		}
+		return nil, err
+	}
+	flowBytes := make([]byte, flowLen)
+	_, err = io.ReadFull(reader, flowBytes)
+	if err != nil {
+		return nil, err
+	}
+	addons.Flow = string(flowBytes)
+
+	seedLen, err := binary.ReadUvarint(reader)
+	if err != nil {
+		if err == io.EOF {
+			return &addons, nil
+		}
+		return nil, err
+	}
+	seedBytes := make([]byte, seedLen)
+	_, err = io.ReadFull(reader, seedBytes)
+	if err != nil {
+		return nil, err
+	}
+	addons.Seed = string(seedBytes)
+
 	return &addons, nil
 }
 
@@ -169,10 +189,15 @@ func WriteRequest(writer io.Writer, request Request, payload []byte) error {
 
 func EncodeRequest(request Request, buffer *buf.Buffer) error {
 	var addonsLen int
+	var paddingLen int
 	if request.Flow != "" {
 		addonsLen += 1 // protobuf header
 		addonsLen += varbin.UvarintLen(uint64(len(request.Flow)))
 		addonsLen += len(request.Flow)
+	} else {
+		// Anti-DPI #4: random padding 16-64B for non-XTLS flows.
+		paddingLen = randPaddingLen()
+		addonsLen = paddingLen
 	}
 	common.Must(
 		buffer.WriteByte(Version),
@@ -180,9 +205,14 @@ func EncodeRequest(request Request, buffer *buf.Buffer) error {
 		buffer.WriteByte(byte(addonsLen)),
 	)
 	if addonsLen > 0 {
-		common.Must(buffer.WriteByte(10))
-		binary.PutUvarint(buffer.Extend(varbin.UvarintLen(uint64(len(request.Flow)))), uint64(len(request.Flow)))
-		common.Must(common.Error(buffer.WriteString(request.Flow)))
+		if request.Flow != "" {
+			common.Must(buffer.WriteByte(10))
+			binary.PutUvarint(buffer.Extend(varbin.UvarintLen(uint64(len(request.Flow)))), uint64(len(request.Flow)))
+			common.Must(common.Error(buffer.WriteString(request.Flow)))
+		} else {
+			padBuf := buffer.Extend(paddingLen)
+			_, _ = rand.Read(padBuf)
+		}
 	}
 	common.Must(
 		buffer.WriteByte(request.Command),
@@ -209,6 +239,9 @@ func RequestLen(request Request) int {
 		addonsLen += varbin.UvarintLen(uint64(len(request.Flow)))
 		addonsLen += len(request.Flow)
 		requestLen += addonsLen
+	} else {
+		// Anti-DPI #4: reserve max padding length (actual is randomized in EncodeRequest)
+		requestLen += vlessPaddingMax
 	}
 	requestLen += 1 // command
 	if request.Command != vmess.CommandMux {
